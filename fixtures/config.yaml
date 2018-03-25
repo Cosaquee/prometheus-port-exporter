@@ -1,0 +1,5 @@
+ports:
+  - name: 'neo4j'
+    port: 7474
+  - name: 'postgres'
+    port: 5432
