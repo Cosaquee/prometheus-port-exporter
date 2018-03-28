@@ -17,7 +17,7 @@ use std::net::TcpStream;
 
 use futures::future::Future;
 
-use hyper::header::ContentLength;
+use hyper::{Method, StatusCode};
 use hyper::server::{Http, Request, Response, Service};
 
 use prometheus::{Encoder, Gauge, TextEncoder, Registry, Opts};
@@ -32,6 +32,12 @@ struct Port {
     port: u64
 }
 
+#[derive(Clone)]
+struct Entry {
+    gauge: Gauge,
+    port: Port
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Config {
     ports: Vec<Port>
@@ -39,8 +45,9 @@ struct Config {
 
 #[derive(Clone)]
 struct Exporter {
-    config: Config,
-    logger: slog::Logger
+    metrics: Vec<Entry>,
+    logger: slog::Logger,
+    registry: Registry
 }
 
 impl Service for Exporter {
@@ -50,35 +57,44 @@ impl Service for Exporter {
 
     type Future = Box<Future<Item=Self::Response, Error=Self::Error>>;
 
-    fn call(&self, _req: Request) -> Self::Future {
-        let registry = Registry::new();
+    fn call(&self, req: Request) -> Self::Future {
+        let mut response = Response::new();
 
-        for port in &self.config.ports {
-            let opts = Opts::new("proccess_up", "check if port is up")
-                .const_label("name", &port.name)
-                .const_label("port", &port.port.to_string());
-            let gauge = Gauge::with_opts(opts).unwrap();
-            registry.register(Box::new(gauge.clone())).unwrap();
-
-            match TcpStream::connect("127.0.0.1:".to_string() + &port.port.to_string()) {
-                Ok(_) => gauge.set(1.0),
-                Err(_) => {
-                    error!(self.logger, "Error connecting to"; "service" => port.name.clone(), "port" => port.port.clone());
-                    gauge.set(0.0);
-                }
-            };  
+        match (req.method(), req.path()) {
+            (&Method::Get, "/") => {
+                response.set_body("<html>
+             <head><title>Marathon Exporter</title></head>
+             <body>
+             <h1>Marathon Exporter</h1>
+             <p><a href='9099'>Metrics</a></p>
+             </body>
+             </html>`");
+                return Box::new(futures::future::ok(response));
+            },
+            (&Method::Get, "/metrics") => {
+              for port in &self.metrics  {
+                  match TcpStream::connect("127.0.0.1:".to_string() + &port.port.port.to_string()) {
+                    Ok(_) => port.gauge.set(1.0),
+                    Err(_) => {
+                        error!(self.logger, "Error connecting to"; "service" => port.port.name.clone(), "port" => port.port.port.clone());
+                        port.gauge.set(0.0);
+                    }
+                };  
+              } 
+            },
+            _ => {
+                response.set_status(StatusCode::NotFound);
+            },
         }
 
         let mut buffer = Vec::<u8>::new();
         let encoder = TextEncoder::new();
-        let metrics_familys = registry.gather();
+        let metrics_familys = self.registry.gather();
         encoder.encode(&metrics_familys, &mut buffer).unwrap();
 
-        Box::new(futures::future::ok(
-            Response::new()
-            .with_header(ContentLength(buffer.len() as u64))
-            .with_body(buffer)
-        ))
+        response.set_body(buffer);
+
+        return Box::new(futures::future::ok(response));
     }
 }
 
@@ -115,9 +131,22 @@ fn main() {
     file.read_to_string(&mut contents).expect("Unable to read the file");
 
     let config : Config = serde_yaml::from_str(&contents).unwrap();
+    let registry = Registry::new();
 
-    let address = "127.0.0.1:".to_string() + port;
-    let exporter = Exporter {config: config, logger: logger};
+    let mut gauges = Vec::new();
+
+    for port in config.ports {
+        let opts = Opts::new("proccess_up", "check if port is up")
+            .const_label("name", &port.name)
+            .const_label("port", &port.port.to_string());
+        let gauge = Gauge::with_opts(opts).unwrap();
+        registry.register(Box::new(gauge.clone())).unwrap();
+
+        gauges.push(Entry {port: port, gauge: gauge});
+    }
+
+    let address = "0.0.0.0:".to_string() + port;
+    let exporter = Exporter {metrics: gauges, logger: logger, registry: registry};
     let server = Http::new().bind(&address.parse().unwrap(), move || Ok(exporter.clone())).unwrap();
     server.run().unwrap();
 }
